@@ -21,5 +21,25 @@
     ],
     "[python]": {
         "editor.defaultFormatter": "charliermarsh.ruff"
-    }
+    },
+    "workbench.colorCustomizations": {
+        "activityBar.activeBackground": "#fea633",
+        "activityBar.background": "#fea633",
+        "activityBar.foreground": "#15202b",
+        "activityBar.inactiveForeground": "#15202b99",
+        "activityBarBadge.background": "#017f48",
+        "activityBarBadge.foreground": "#e7e7e7",
+        "commandCenter.border": "#15202b99",
+        "sash.hoverBorder": "#fea633",
+        "statusBar.background": "#fd9001",
+        "statusBar.foreground": "#15202b",
+        "statusBarItem.hoverBackground": "#ca7301",
+        "statusBarItem.remoteBackground": "#fd9001",
+        "statusBarItem.remoteForeground": "#15202b",
+        "titleBar.activeBackground": "#fd9001",
+        "titleBar.activeForeground": "#15202b",
+        "titleBar.inactiveBackground": "#fd900199",
+        "titleBar.inactiveForeground": "#15202b99"
+    },
+    "peacock.remoteColor": "#fd9001"
 }

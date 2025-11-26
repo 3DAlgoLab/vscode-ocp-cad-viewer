@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <title>OCP CAD Viewer - HTTP Edition</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/viewer.css') }}" />
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/dragdrop.css') }}" />
     <script type="module">
         // Import core CAD viewer components
         import { Viewer, Display, Timer } from "{{ url_for('static', filename='js/three-cad-viewer.esm.js') }}";
@@ -78,6 +79,27 @@
                 return await this.post('/api/model', modelData);
             }
 
+            async uploadPythonFile(file) {
+                const formData = new FormData();
+                formData.append('file', file);
+                
+                try {
+                    const response = await fetch(`${this.baseUrl}/api/upload/python`, {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
+                    return await response.json();
+                } catch (error) {
+                    console.error('Python file upload failed:', error);
+                    throw error;
+                }
+            }
+
             async updateStatus(statusData) {
                 return await this.post(`/api/viewer/${this.viewerId}/status`, statusData);
             }
@@ -88,6 +110,29 @@
 
             async updateConfig(configData) {
                 return await this.post('/api/config', configData);
+            }
+
+            // Measurement API methods
+            async measureDistance(shapeId1, shapeId2, center = false) {
+                return await this.post('/api/measure/distance', {
+                    shape_id1: shapeId1,
+                    shape_id2: shapeId2,
+                    center: center
+                });
+            }
+
+            async measureProperties(shapeId) {
+                return await this.post('/api/measure/properties', {
+                    shape_id: shapeId
+                });
+            }
+
+            async getAvailableShapes() {
+                return await this.get('/api/measure/shapes');
+            }
+
+            async setActiveTool(toolName) {
+                return await this.post(`/api/tool/${toolName}`);
             }
         }
 
@@ -248,10 +293,63 @@
             defaultColor: "{{ initial_config.default_color }}"
         };
 
+        // Measurement handler for HTTP API integration
+        async function handleMeasurementRequest(toolType, selectedIds, additionalParams = {}) {
+            try {
+                console.log(`Measurement request: ${toolType}`, selectedIds, additionalParams);
+                
+                let result;
+                if (toolType === "DistanceMeasurement") {
+                    if (selectedIds.length >= 2) {
+                        result = await http.measureDistance(selectedIds[0], selectedIds[1], selectedIds[2] || false);
+                    } else {
+                        throw new Error('Distance measurement requires at least 2 selections');
+                    }
+                } else if (toolType === "PropertiesMeasurement") {
+                    if (selectedIds.length >= 1) {
+                        result = await http.measureProperties(selectedIds[0]);
+                    } else {
+                        throw new Error('Properties measurement requires at least 1 selection');
+                    }
+                } else {
+                    throw new Error(`Unknown tool type: ${toolType}`);
+                }
+                
+                if (result.success) {
+                    console.log('Measurement result:', result.data);
+                    // Send the measurement result back to the viewer
+                    if (viewer && viewer.display && viewer.display.handleMeasurementResponse) {
+                        viewer.display.handleMeasurementResponse(result.data);
+                    }
+                } else {
+                    console.error('Measurement failed:', result.error);
+                }
+                
+            } catch (error) {
+                console.error('Measurement request failed:', error);
+            }
+        }
+
         // Notification callback for viewer state changes
         function nc(change) {
             if (_config && _config.debug) {
                 debugLog("notify", change);
+            }
+
+            // Handle measurement tool requests
+            if (change.activeTool !== undefined) {
+                const toolName = change.activeTool.new;
+                http.setActiveTool(toolName || 'none').catch(console.error);
+            }
+
+            // Handle measurement requests
+            if (change.selectedShapeIDs !== undefined && change.activeTool !== undefined) {
+                const selectedIds = change.selectedShapeIDs.new;
+                const activeTool = change.activeTool.new;
+                
+                if (activeTool && activeTool !== "None" && selectedIds && selectedIds.length > 0) {
+                    handleMeasurementRequest(activeTool, selectedIds);
+                }
             }
 
             // Update camera state variables
@@ -508,8 +606,150 @@
             }
         }, true);
 
+        // Drag and drop functionality
+        function setupDragAndDrop() {
+            const viewer = document.getElementById("cad_viewer");
+            
+            // Prevent default drag behaviors
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                viewer.addEventListener(eventName, preventDefaults, false);
+                document.body.addEventListener(eventName, preventDefaults, false);
+            });
+            
+            // Highlight drop area when item is dragged over it
+            ['dragenter', 'dragover'].forEach(eventName => {
+                viewer.addEventListener(eventName, highlight, false);
+            });
+            
+            ['dragleave', 'drop'].forEach(eventName => {
+                viewer.addEventListener(eventName, unhighlight, false);
+            });
+            
+            // Handle dropped files
+            viewer.addEventListener('drop', handleDrop, false);
+        }
+        
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+        
+        function highlight(e) {
+            document.getElementById('cad_viewer').classList.add('drag-over');
+        }
+        
+        function unhighlight(e) {
+            document.getElementById('cad_viewer').classList.remove('drag-over');
+        }
+        
+        async function handleDrop(e) {
+            const dt = e.dataTransfer;
+            const files = dt.files;
+            
+            if (files.length > 0) {
+                const file = files[0];
+                
+                if (file.name.endsWith('.py')) {
+                    console.log('Processing Python file:', file.name);
+                    
+                    try {
+                        // Show loading indicator
+                        showLoadingIndicator('Processing Python file...');
+                        
+                        // Upload and process the Python file
+                        const result = await http.uploadPythonFile(file);
+                        
+                        if (result.success) {
+                            console.log('Python file processed successfully:', result);
+                            
+                            // Display the generated model
+                            if (result.model_data && result.model_data.shapes) {
+                                showViewer(result.model_data.shapes, result.model_data.config || {});
+                            }
+                            
+                            // Show success message
+                            showNotification(`Successfully processed ${file.name}`, 'success');
+                        } else {
+                            showNotification(`Error processing ${file.name}: ${result.error}`, 'error');
+                        }
+                        
+                    } catch (error) {
+                        console.error('Failed to process Python file:', error);
+                        showNotification(`Failed to process ${file.name}: ${error.message}`, 'error');
+                    } finally {
+                        hideLoadingIndicator();
+                    }
+                } else {
+                    showNotification(`Only Python files (.py) are supported`, 'warning');
+                }
+            }
+        }
+        
+        function showLoadingIndicator(message) {
+            const indicator = document.createElement('div');
+            indicator.id = 'loading-indicator';
+            indicator.className = 'loading-indicator';
+            indicator.innerHTML = `
+                <div class="loading-spinner"></div>
+                <div class="loading-message">${message}</div>
+            `;
+            document.body.appendChild(indicator);
+        }
+        
+        function hideLoadingIndicator() {
+            const indicator = document.getElementById('loading-indicator');
+            if (indicator) {
+                indicator.remove();
+            }
+        }
+        
+        function showNotification(message, type = 'info') {
+            const notification = document.createElement('div');
+            notification.className = `notification notification-${type}`;
+            notification.textContent = message;
+            
+            // Position notification at top-right
+            notification.style.position = 'fixed';
+            notification.style.top = '20px';
+            notification.style.right = '20px';
+            notification.style.zIndex = '9999';
+            notification.style.padding = '12px 20px';
+            notification.style.borderRadius = '4px';
+            notification.style.color = 'white';
+            notification.style.fontSize = '14px';
+            notification.style.maxWidth = '300px';
+            
+            // Set background color based on type
+            switch (type) {
+                case 'success':
+                    notification.style.backgroundColor = '#28a745';
+                    break;
+                case 'error':
+                    notification.style.backgroundColor = '#dc3545';
+                    break;
+                case 'warning':
+                    notification.style.backgroundColor = '#ffc107';
+                    notification.style.color = '#212529';
+                    break;
+                default:
+                    notification.style.backgroundColor = '#17a2b8';
+            }
+            
+            document.body.appendChild(notification);
+            
+            // Auto-remove after 5 seconds
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 5000);
+        }
+
         // Initialize on page load
-        window.addEventListener("load", initializeViewer);
+        window.addEventListener("load", function() {
+            initializeViewer();
+            setupDragAndDrop();
+        });
     </script>
 </head>
 <body style="padding: 0px; width: fit-content">

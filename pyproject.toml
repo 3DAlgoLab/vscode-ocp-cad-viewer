@@ -103,3 +103,6 @@ replace = '"version": "{new_version}"'
 filename = "README.md"
 search = 'OCP CAD Viewer {current_version}'
 replace = 'OCP CAD Viewer {new_version}'
+
+[tool.uv.workspace]
+members = ["ocp_web"]

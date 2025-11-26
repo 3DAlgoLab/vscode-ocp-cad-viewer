@@ -1,133 +1,47 @@
-// WebSocket Communication Module for OCP Web Viewer
-// Simplified version without VSCode dependency
+function handleMessage(message) {
+    console.log("Handling message");
+    window.postMessage(message, window.location.origin);
+}
 
-export class Comms {
+class Comms {
     constructor(host, port) {
-        this.host = host;
-        this.port = port;
-        this.ws = null;
-        this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 5;
-        this.reconnectDelay = 1000;
-        this.messageQueue = [];
-        this.isConnected = false;
-        
-        this.connect();
-    }
-    
-    connect() {
-        try {
-            this.ws = new WebSocket(`ws://${this.host}:${this.port}/`);
-            
-            this.ws.onopen = () => {
-                console.log('WebSocket connected');
-                this.isConnected = true;
-                this.reconnectAttempts = 0;
-                
-                // Send registration message
-                this.send('L:', '');
-                
-                // Process queued messages
-                while (this.messageQueue.length > 0) {
-                    const message = this.messageQueue.shift();
-                    this.ws.send(message);
-                }
-            };
-            
-            this.ws.onmessage = (event) => {
-                try {
-                    const data = event.data;
-                    if (typeof data === 'string') {
-                        // Convert WebSocket message to window.postMessage for compatibility
-                        const message = this.parseMessage(data);
-                        window.postMessage(message, '*');
-                    }
-                } catch (error) {
-                    console.error('Error processing WebSocket message:', error);
-                }
-            };
-            
-            this.ws.onclose = () => {
-                console.log('WebSocket disconnected');
-                this.isConnected = false;
-                this.attemptReconnect();
-            };
-            
-            this.ws.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                this.isConnected = false;
-            };
-            
-        } catch (error) {
-            console.error('Failed to create WebSocket:', error);
-            this.attemptReconnect();
-        }
-    }
-    
-    parseMessage(data) {
-        // Parse message format: "TYPE:CONTENT"
-        if (data.length < 2) return null;
-        
-        const type = data[0];
-        const content = data.substring(2);
-        
-        try {
-            const parsed = JSON.parse(content);
-            return { type: this.getMessageType(type), data: parsed };
-        } catch (error) {
-            // For simple messages that aren't JSON
-            return { type: this.getMessageType(type), text: content };
-        }
-    }
-    
-    getMessageType(typeChar) {
-        const types = {
-            'C': 'command',
-            'D': 'data', 
-            'S': 'config',
-            'U': 'update',
-            'L': 'listen',
-            'B': 'backend',
-            'R': 'response'
+        this.socket = new WebSocket(`ws://${host}:${port}`);
+        this.ready = false;
+
+        this.socket.onopen = (event) => {
+            console.log("WebSocket connection established");
+            this.ready = true;
+            this.register();
         };
-        return types[typeChar] || 'unknown';
+
+        this.socket.onmessage = (event) => {
+            console.log(
+                "Message received from server:",
+                event.data.substring(0, 200) + "..."
+            );
+            handleMessage(event.data);
+        };
+
+        this.socket.onerror = (error) => {
+            console.error("WebSocket error:", error);
+        };
+
+        this.socket.onclose = (event) => {
+            console.log("WebSocket connection closed");
+        };
     }
-    
-    sendStatus(message) {
-        this.send('U:', JSON.stringify({
-            command: 'status',
-            text: message
-        }));
+
+    register() {
+        const msg = "L:{}";
+        this.socket.send(msg);
     }
-    
-    send(message) {
-        if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.send(message);
-        } else {
-            // Queue message for when connection is restored
-            this.messageQueue.push(message);
-            console.log('Message queued (not connected):', message);
-        }
-    }
-    
-    attemptReconnect() {
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-            this.reconnectAttempts++;
-            console.log(`Attempting to reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
-            
-            setTimeout(() => {
-                this.connect();
-            }, this.reconnectDelay * this.reconnectAttempts);
-        } else {
-            console.error('Max reconnection attempts reached');
-        }
-    }
-    
-    close() {
-        this.isConnected = false;
-        if (this.ws) {
-            this.ws.close();
-            this.ws = null;
+
+    sendStatus(status) {
+        if (this.ready) {
+            const msg = `U:${JSON.stringify(status)}`;
+            this.socket.send(msg);
         }
     }
 }
+
+export { Comms };

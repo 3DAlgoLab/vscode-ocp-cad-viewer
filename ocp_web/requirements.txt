@@ -1,0 +1,5 @@
+# OCP Web Viewer Requirements
+
+flask==2.3.3
+flask-cors==4.0.0
+orjson==3.9.10

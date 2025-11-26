@@ -92,24 +92,62 @@ STATIC = """
 
 
 def COMMS(host, port):
+    """
+    Generate JavaScript code for standalone viewer communication setup.
+    
+    This function creates the frontend JavaScript that:
+    1. Establishes WebSocket communication with Flask backend
+    2. Creates a mock vscode API for compatibility with existing viewer code
+    3. Sets up initial viewer state with OCP logo display
+    4. Replaces global showViewer function (BUG: causes infinite recursion)
+    
+    Args:
+        host (str): WebSocket server hostname
+        port (int): WebSocket server port
+        
+    Returns:
+        str: JavaScript code template to be injected into HTML page
+        
+    Frontend Transaction Flow:
+    1. Browser loads page → WebSocket connection established
+    2. Mock vscode object created → Routes messages through WebSocket instead of VSCode extension
+    3. standaloneViewer function defined → Shows OCP logo on initial load
+    4. window.showViewer replaced → Future calls use standalone mode (BUG: infinite recursion)
+    5. Python show() calls → WebSocket messages → Browser updates viewer
+    """
     return f"""
+        // Establish WebSocket connection to Flask backend for real-time communication
         const comms = new Comms("{host}", {port});
+        
+        // Create mock vscode API to maintain compatibility with VSCode extension viewer code
+        // Routes postMessage calls through WebSocket instead of VSCode extension
         const vscode = {{postMessage: (msg) => {{
                 comms.sendStatus(msg);
             }}
         }};
+        
+        // Standalone viewer initialization function
+        // BUG: This creates infinite recursion when window.showViewer is replaced below
         const standaloneViewer = () => {{
             
+            // Load and decode the OCP logo for initial display
             const ocpLogo = logo();
             decode(ocpLogo);
             
+            // Call original showViewer function with logo data
+            // BUG: After window.showViewer replacement, this calls standaloneViewer again → infinite recursion
             viewer = showViewer(ocpLogo.data.shapes, ocpLogo.config);
             window.viewer = viewer;
         }}
+        
+        // Replace global showViewer function with standalone version
+        // BUG: This causes infinite recursion when standaloneViewer calls showViewer()
         window.showViewer = standaloneViewer;
     """
 
 
+# HTML body onload attribute - triggers initial viewer display when page loads
+# Calls showViewer() which may be replaced by standaloneViewer (causing infinite recursion bug)
 INIT = """onload="showViewer()" """
 
 
@@ -173,6 +211,7 @@ def is_port_in_use(port, host="127.0.0.1"):
             hosts_to_check = [(host, socket.AF_INET)]
 
     for check_host, family in hosts_to_check:
+        bind_sock = None  # Initialize to avoid unbound variable error
         # First try a connection test (more reliable, especially on Windows)
         try:
             test_sock = socket.socket(family, socket.SOCK_STREAM)
@@ -220,7 +259,8 @@ def is_port_in_use(port, host="127.0.0.1"):
             pass
         finally:
             try:
-                bind_sock.close()
+                if bind_sock is not None:
+                    bind_sock.close()
             except:
                 pass
 
@@ -228,25 +268,38 @@ def is_port_in_use(port, host="127.0.0.1"):
 
 
 class Viewer:
+    """
+    Main standalone viewer server class that handles frontend-backend communication.
+    
+    Frontend Architecture:
+    - Flask HTTP server serves the HTML page and static assets
+    - WebSocket server handles real-time bidirectional communication
+    - Mock vscode API maintains compatibility with VSCode extension code
+    - Python show() calls → WebSocket → Browser viewer updates
+    """
     def __init__(self, params):
-        self.status = {}
-        self.config = {}
+        self.status = {}           # Track viewer state (camera, selection, etc.)
+        self.config = {}           # Viewer configuration settings
         self.debug = params.get("debug", False)
         self.params = params
-        self.port = params.get("port", 3939)
-        self.host = params.get("host", "127.0.0.1")
+        self.port = params.get("port", 3939)      # WebSocket port
+        self.host = params.get("host", "127.0.0.1")  # WebSocket host
 
         self.configure(self.params)
 
+        # Initialize Flask app and WebSocket server
         self.app = Flask(__name__)
         self.sock = Sock(self.app)
 
+        # Backend for processing 3D model data
         self.backend = ViewerBackend(self.port)
 
-        self.python_client = None
-        self.javascript_client = None
-        self.splash = True
+        # Client connection tracking
+        self.python_client = None      # WebSocket connection from Python scripts
+        self.javascript_client = None  # WebSocket connection from browser
+        self.splash = True           # Show OCP logo on first load
 
+        # Setup routes: WebSocket for messages, HTTP for page serving
         self.sock.route("/")(self.handle_message)
         self.app.add_url_rule("/viewer", "viewer", self.index)
         self.app.add_url_rule(
@@ -322,6 +375,15 @@ class Viewer:
         self.debug_print("\nConfig:", self.config)
 
     def start(self):
+        """
+        Start the standalone viewer server.
+        
+        Frontend Transaction Flow:
+        1. Check port availability → Exit if occupied
+        2. Load OCP logo model into backend for initial display
+        3. Start Flask server → Browser can connect → WebSocket established
+        4. Browser loads page → JavaScript executes → Viewer ready for Python commands
+        """
         # Check if port is in use on both IPv4 and IPv6
         if is_port_in_use(self.port, self.host):
             print(
@@ -330,11 +392,32 @@ class Viewer:
             )
             sys.exit(1)
 
+        # Pre-load OCP logo model for initial splash screen
         self.backend.load_model(logo)
 
+        # Start Flask server - begins serving frontend and handling WebSocket connections
         self.app.run(port=self.port, host=self.host)
 
     def index(self):
+        """
+        Main Flask route handler for serving the viewer HTML page.
+        
+        Frontend Transaction Flow:
+        1. Browser requests /viewer → Flask calls this method
+        2. Extract browser's connection info (host:port) for WebSocket setup
+        3. Render viewer.html template with injected JavaScript code:
+           - standalone_scripts: Core CAD viewer modules
+           - standalone_imports: ES6 module imports for Comms and logo
+           - standalone_comms: WebSocket setup + mock vscode API (contains infinite recursion bug)
+           - standalone_init: onload="showViewer()" triggers initial display
+        4. Browser receives HTML → JavaScript executes → WebSocket connects → Viewer initializes
+        
+        Args:
+            None (uses Flask request object)
+            
+        Returns:
+            str: Rendered HTML page with injected JavaScript code
+        """
         # The browser will connect with an ip/hostname that is reachable from remote.
         # Use this ip/hostname for the websocket connection
         address, port = request.host.split(":")
@@ -351,11 +434,41 @@ class Viewer:
         )
 
     def not_registered(self):
+        """
+        Error handler for when Python tries to send data but no browser is connected.
+        
+        Frontend Transaction Issue:
+        - Python show() calls → WebSocket message → No browser to receive
+        - User must open browser page to establish WebSocket connection
+        """
         print(
             "\nNo browser registered. Please open the viewer in a browser or refresh the viewer page\n"
         )
 
-    def handle_message(self, ws):
+def handle_message(self, ws):
+        """
+        WebSocket message handler for bidirectional communication between Python and browser.
+        
+        Frontend Transaction Flow:
+        1. Python show() → WebSocket message (type D/S/C) → Browser → Viewer updates
+        2. Browser UI changes → WebSocket message (type U) → Python → Status updates
+        3. Screenshot requests → Browser captures → WebSocket (type U) → Python saves file
+        
+        Message Types:
+        - C: Command messages from Python (status, config, screenshot requests)
+        - D: Data messages from Python (new 3D models to display)
+        - S: Config messages from Python (viewer configuration changes)
+        - U: Update messages from Browser (UI changes, screenshots, logs)
+        - L: Listen messages (Browser registration)
+        - B: Backend messages (Model data to backend processing)
+        - R: Response messages (Backend responses to Browser)
+        
+        Args:
+            ws: WebSocket connection object
+            
+        Returns:
+            None (runs in infinite loop handling messages)
+        """
         while True:
             data = ws.receive()
             if isinstance(data, bytes):
@@ -365,6 +478,7 @@ class Viewer:
             data = data[2:]
 
             if message_type == "C":
+                # Command messages from Python client
                 self.python_client = ws
                 cmd = orjson.loads(data)
                 if cmd == "status":
@@ -385,16 +499,19 @@ class Viewer:
                     self.javascript_client.send(data)
 
             elif message_type == "D":
+                # Data messages - new 3D models from Python show() calls
                 self.python_client = ws
                 self.debug_print("Received a new model")
                 if self.javascript_client is None:
                     self.not_registered()
                     continue
+                # Forward model data to browser for display
                 self.javascript_client.send(data)
                 if self.splash:
                     self.splash = False
 
             elif message_type == "U":
+                # Update messages from browser (UI changes, screenshots, logs)
                 self.javascript_client = ws
                 message = orjson.loads(data)
                 if message["command"] == "screenshot":
@@ -407,16 +524,19 @@ class Viewer:
                 elif message["command"] == "started":
                     self.debug_print("Viewer.log:", "Viewer has started")
                 else:
+                    # UI state changes (selection, camera, etc.)
                     changes = message["text"]
                     self.debug_print("Received incremental UI changes", changes)
                     for key, value in changes.items():
                         if key == "selected":
+                            # Copy selected object IDs to clipboard
                             pyperclip.copy((",").join(changes.get("selected", [])))
 
                         self.status[key] = value
                     self.backend.handle_event(changes, MessageType.UPDATES)
 
             elif message_type == "S":
+                # Config messages from Python
                 self.python_client = ws
                 self.debug_print("Received a config")
                 if self.javascript_client is None:
@@ -426,15 +546,18 @@ class Viewer:
                 self.debug_print("Posted config to view")
 
             elif message_type == "L":
+                # Browser registration message
                 self.javascript_client = ws
                 print("\nBrowser as viewer client registered\n")
 
             elif message_type == "B":
+                # Backend processing messages
                 model = orjson.loads(data)["model"]
                 self.backend.handle_event(model, MessageType.DATA)
-                self.debug_print("Model data sent to the backend")
+                self.debug_print("Model data sent to backend")
 
             elif message_type == "R":
+                # Backend response messages
                 self.python_client = ws
                 if self.javascript_client is None:
                     self.not_registered()

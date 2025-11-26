@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>OCP CAD Viewer - HTTP Edition</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/viewer.css') }}" />
+    <script type="module">
+        // Import core CAD viewer components
+        import { Viewer, Display, Timer } from "{{ url_for('static', filename='js/three-cad-viewer.esm.js') }}";
+
+        // Global variables for viewer state management
+        var viewer = null;
+        var display = null;
+        var _shapes = null;
+        var _states = null;
+        var _config = null;
+        var _zoom = null;
+        var _position = null;
+        var _quaternion = null;
+        var _target = null;
+        var _clipping = {
+            sliders: [],
+            normals: [],
+            planeHelpers: null,
+            objectColors: null,
+            intersection: null
+        };
+        var oldStates = null;
+        var viewerOptions = {};
+        var last_bb_radius = null;
+
+        // HTTP API communication
+        const API_BASE = '{{ api_base }}';
+        const VIEWER_ID = '{{ viewer_id }}';
+
+        // HTTP client for API calls
+        class HttpClient {
+            constructor(baseUrl, viewerId) {
+                this.baseUrl = baseUrl;
+                this.viewerId = viewerId;
+            }
+
+            async post(endpoint, data) {
+                try {
+                    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify(data)
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    
+                    return await response.json();
+                } catch (error) {
+                    console.error('API call failed:', error);
+                    throw error;
+                }
+            }
+
+            async get(endpoint) {
+                try {
+                    const response = await fetch(`${this.baseUrl}${endpoint}`);
+                    if (!response.ok) {
+                        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+                    }
+                    return await response.json();
+                } catch (error) {
+                    console.error('API call failed:', error);
+                    throw error;
+                }
+            }
+
+            async uploadModel(modelData) {
+                return await this.post('/api/model', modelData);
+            }
+
+            async updateStatus(statusData) {
+                return await this.post(`/api/viewer/${this.viewerId}/status`, statusData);
+            }
+
+            async getConfig() {
+                return await this.get('/api/config');
+            }
+
+            async updateConfig(configData) {
+                return await this.post('/api/config', configData);
+            }
+        }
+
+        const http = new HttpClient(API_BASE, VIEWER_ID);
+
+        // Server-Sent Events for real-time updates
+        class EventSourceClient {
+            constructor(viewerId) {
+                this.viewerId = viewerId;
+                this.eventSource = null;
+                this.reconnectAttempts = 0;
+                this.maxReconnectAttempts = 5;
+            }
+
+            connect() {
+                try {
+                    this.eventSource = new EventSource(`${API_BASE}/api/viewer/${this.viewerId}/events`);
+                    
+                    this.eventSource.onopen = () => {
+                        console.log('SSE connection opened');
+                        this.reconnectAttempts = 0;
+                    };
+                    
+                    this.eventSource.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            this.handleEvent(data);
+                        } catch (error) {
+                            console.error('Error parsing SSE message:', error);
+                        }
+                    };
+                    
+                    this.eventSource.onerror = (error) => {
+                        console.error('SSE error:', error);
+                        this.attemptReconnect();
+                    };
+                    
+                } catch (error) {
+                    console.error('Failed to create SSE connection:', error);
+                    this.attemptReconnect();
+                }
+            }
+
+            handleEvent(data) {
+                if (data.type === 'model_update') {
+                    // New model data received
+                    showViewer(data.data.shapes, data.data.config);
+                } else if (data.type === 'status_update') {
+                    // Status updates from other clients
+                    console.log('Status update:', data.data);
+                } else if (data.type === 'heartbeat') {
+                    // Keep connection alive
+                    console.log('Heartbeat received');
+                }
+            }
+
+            attemptReconnect() {
+                if (this.reconnectAttempts < this.maxReconnectAttempts) {
+                    this.reconnectAttempts++;
+                    console.log(`Attempting SSE reconnection (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`);
+                    
+                    setTimeout(() => {
+                        this.connect();
+                    }, 1000 * this.reconnectAttempts);
+                } else {
+                    console.error('Max SSE reconnection attempts reached');
+                }
+            }
+
+            close() {
+                if (this.eventSource) {
+                    this.eventSource.close();
+                    this.eventSource = null;
+                }
+            }
+        }
+
+        const sseClient = new EventSourceClient(VIEWER_ID);
+
+        // Mock vscode API for compatibility with existing viewer code
+        const vscode = {
+            postMessage: async (msg) => {
+                try {
+                    // Send status updates via HTTP API
+                    await http.updateStatus(msg);
+                } catch (error) {
+                    console.error('Failed to send status:', error);
+                }
+            }
+        };
+
+        // Message sending function
+        function send(command, message) {
+            vscode.postMessage({
+                command: command,
+                text: message
+            });
+        }
+
+        // Debug logging
+        function debugLog(tag, obj) {
+            console.log(tag, obj);
+            let msg = tag + (obj ? " " + JSON.stringify(obj) : "");
+            send("log", msg);
+        }
+
+        // Minimum width constraint
+        const minWidth = 450;
+
+        // Default configuration options
+        const displayDefaultOptions = {
+            cadWidth: 730,
+            height: 525,
+            treeWidth: {{ initial_config.tree_width }},
+            glass: {{ initial_config.glass|lower }},
+            theme: "{{ initial_config.theme }}",
+            tools: {{ initial_config.tools|lower }},
+            pinning: false,
+            keymap: {
+                shift: "shiftKey",
+                ctrl: "ctrlKey", 
+                meta: "metaKey",
+                alt: "altKey"
+            },
+            newTreeBehavior: true,
+            measurementDebug: false,
+            measureTools: true,
+            selectTool: true,
+            explodeTool: true,
+            zscaleTool: false
+        };
+
+        const viewerDefaultOptions = {
+            timeit: false,
+            tools: {{ initial_config.tools|lower }},
+            glass: {{ initial_config.glass|lower }},
+            up: "Z",
+            zoom: 1.0,
+            position: null,
+            quaternion: null,
+            target: null,
+            control: "{{ initial_config.control }}",
+            centerGrid: false,
+            gridFontSize: 12,
+            newTreeBehavior: true
+        };
+
+        const renderDefaultOptions = {
+            ambientIntensity: {{ initial_config.ambient_intensity }},
+            directIntensity: {{ initial_config.direct_intensity }},
+            metalness: {{ initial_config.metalness }},
+            roughness: {{ initial_config.roughness }},
+            edgeColor: 0x707070,
+            defaultOpacity: {{ initial_config.default_opacity }},
+            normalLen: 0,
+            angularTolerance: 0.2,
+            deviation: 0.1,
+            defaultColor: "{{ initial_config.default_color }}"
+        };
+
+        // Notification callback for viewer state changes
+        function nc(change) {
+            if (_config && _config.debug) {
+                debugLog("notify", change);
+            }
+
+            // Update camera state variables
+            if (change.zoom !== undefined) _zoom = change.zoom.new;
+            if (change.position !== undefined) _position = change.position.new;
+            if (change.quaternion !== undefined) _quaternion = change.quaternion.new;
+            if (change.target !== undefined) _target = change.target.new;
+
+            // Update clipping state variables
+            if (change.clip_intersection !== undefined) _clipping.intersection = change.clip_intersection.new;
+            if (change.clip_planes !== undefined) _clipping.planeHelpers = change.clip_planes.new;
+            if (change.clip_object_colors !== undefined) _clipping.objectColors = change.clip_object_colors.new;
+            if (change.clip_slider_0 !== undefined) _clipping.sliders[0] = change.clip_slider_0.new;
+            if (change.clip_slider_1 !== undefined) _clipping.sliders[1] = change.clip_slider_1.new;
+            if (change.clip_slider_2 !== undefined) _clipping.sliders[2] = change.clip_slider_2.new;
+            if (change.clip_normal_0 !== undefined) _clipping.normals[0] = change.clip_normal_0.new;
+            if (change.clip_normal_1 !== undefined) _clipping.normals[1] = change.clip_normal_1.new;
+            if (change.clip_normal_2 !== undefined) _clipping.normals[2] = change.clip_normal_2.new;
+
+            // Build message object with changed properties
+            let changed = false;
+            let message = {};
+            Object.keys(change).forEach((k) => {
+                if (change[k].new !== undefined) {
+                    message[k] = change[k].new;
+                    changed = true;
+                }
+            });
+
+            // Handle tree view state changes
+            if (viewer != null && viewer.treeview != null) {
+                const states_json = JSON.stringify(viewer.treeview.getStates());
+                const states = JSON.parse(states_json);
+                if (oldStates == null || JSON.stringify(oldStates) != states_json) {
+                    message["states"] = states;
+                    oldStates = states;
+                    changed = true;
+                }
+            }
+
+            // Send status update via HTTP API
+            if (changed) {
+                send("status", message);
+            }
+        }
+
+        // Utility functions
+        function preset(config, key, val) {
+            return config == null || config[key] == null ? val : config[key];
+        }
+
+        function getSize() {
+            return { width: window.innerWidth, height: window.innerHeight };
+        }
+
+        function normalizeWidth(width, glass, tools) {
+            const treeWidth = glass || !tools ? 0 : preset(_config, "tree_width", displayDefaultOptions.treeWidth);
+            return Math.max(minWidth - treeWidth, width - treeWidth - 20);
+        }
+
+        function normalizeHeight(height) {
+            return height - 65;
+        }
+
+        function getDisplayOptions(theme) {
+            const size = getSize();
+            const glass = preset(_config, "glass", displayDefaultOptions.glass);
+            theme = theme ? theme : displayDefaultOptions.theme;
+            const tools = preset(_config, "tools", displayDefaultOptions.tools);
+            const treeWidth = preset(_config, "tree_width", displayDefaultOptions.treeWidth);
+            const keymap = preset(_config, "modifier_keys", displayDefaultOptions.keymap);
+            const newTreeBehavior = preset(_config, "new_tree_behavior", viewerDefaultOptions.newTreeBehavior);
+            const cadWidth = normalizeWidth(size.width, glass, tools);
+            
+            return {
+                glass: glass,
+                treeWidth: treeWidth,
+                cadWidth: cadWidth,
+                height: normalizeHeight(size.height),
+                theme: theme,
+                tools: tools,
+                keymap: keymap,
+                newTreeBehavior: newTreeBehavior,
+                measureTools: displayDefaultOptions.measureTools,
+                selectTool: displayDefaultOptions.selectTool,
+                explodeTool: displayDefaultOptions.explodeTool,
+                zscaleTool: displayDefaultOptions.zscaleTool,
+                measurementDebug: displayDefaultOptions.measurementDebug
+            };
+        }
+
+        // Main showViewer function - CLEAN IMPLEMENTATION
+        function showViewer(shapes, config) {
+            debugLog("showViewer called");
+
+            // Clean up existing viewer if present
+            if (viewer != null) {
+                viewer.hasAnimationLoop = false;
+                viewer.continueAnimation = false;
+                viewer.dispose();
+                viewer = null;
+            }
+
+            // Store shapes and configuration globally
+            _shapes = shapes;
+            _config = config;
+
+            // Get display options based on configuration
+            const displayOptions = getDisplayOptions(config ? config.theme : null);
+
+            // Create Display instance if needed
+            if (display == null) {
+                const container = document.getElementById("cad_viewer");
+                container.innerHTML = "";
+                display = new Display(container, displayOptions);
+            }
+
+            // Ensure configuration exists
+            if (_config == null) {
+                debugLog("OCP CAD Viewer: config is null");
+                _config = {};
+            }
+
+            // Create new Viewer instance with notification callback
+            viewer = new Viewer(display, displayOptions, nc, null);
+
+            // Render shapes if available
+            if (_shapes) render();
+
+            // Apply display mode settings
+            display.glassMode(displayOptions.glass);
+            display.showTools(displayOptions.tools);
+
+            debugLog("showViewer finished");
+            return viewer;
+        }
+
+        // Initialize viewer with OCP logo on page load
+        async function initializeViewer() {
+            console.log("Initializing OCP Web Viewer (HTTP-based)...");
+            
+            try {
+                // Load initial configuration
+                const config = await http.getConfig();
+                _config = config;
+                
+                // Create a simple logo placeholder
+                const logoData = {
+                    shapes: {
+                        type: "shapes",
+                        shape: {
+                            type: "assembly",
+                            parts: [
+                                {
+                                    type: "shapes",
+                                    shape: {
+                                        ref: 0
+                                    },
+                                    state: [true, true],
+                                    id: "logo",
+                                    name: "OCP CAD Viewer"
+                                }
+                            ]
+                        },
+                        instances: [
+                            {
+                                vertices: {
+                                    buffer: "AAAAAA==",
+                                    codec: "b64",
+                                    dtype: "float32"
+                                },
+                                obj_vertices: {
+                                    buffer: "AAAAAA==",
+                                    codec: "b64", 
+                                    dtype: "float32"
+                                },
+                                normals: {
+                                    buffer: "AAAAAA==",
+                                    codec: "b64",
+                                    dtype: "float32"
+                                },
+                                triangles: {
+                                    buffer: "AAAAAA==",
+                                    codec: "b64",
+                                    dtype: "int32"
+                                },
+                                edges: {
+                                    buffer: "AAAAAA==",
+                                    codec: "b64",
+                                    dtype: "int32"
+                                }
+                            }
+                        ],
+                        bb: {
+                            xmin: -5, xmax: 5,
+                            ymin: -5, ymax: 5,
+                            zmin: -5, zmax: 5
+                        }
+                    },
+                    config: {
+                        _splash: true,
+                        debug: false,
+                        glass: false,
+                        tools: true,
+                        tree_width: 240,
+                        theme: "browser",
+                        control: "trackball",
+                        axes: false,
+                        grid: false,
+                        ortho: false,
+                        transparent: false,
+                        default_opacity: 1.0,
+                        ambient_intensity: 1.0,
+                        direct_intensity: 1.1,
+                        metalness: 0.3,
+                        roughness: 0.65,
+                        default_color: "#e8b024",
+                        default_edgecolor: "#808080",
+                        zoom: 1.0,
+                        reset_camera: "reset"
+                    }
+                };
+                
+                // Show viewer with logo
+                showViewer(logoData.shapes, logoData.config);
+                window.viewer = viewer;
+                
+                // Connect SSE for real-time updates
+                sseClient.connect();
+                
+                // Notify backend that viewer has started
+                send("started", {});
+                
+            } catch (error) {
+                console.error('Failed to initialize viewer:', error);
+            }
+        }
+
+        // Window resize handler
+        window.addEventListener("resize", function(event) {
+            if (viewer != null) {
+                const displayOptions = getDisplayOptions(_config ? _config.theme : null);
+                viewer.resizeCadView(
+                    displayOptions.cadWidth,
+                    displayOptions.treeWidth,
+                    displayOptions.height,
+                    displayOptions.glass
+                );
+                if (viewer.gridHelper) {
+                    viewer.gridHelper.clearCache();
+                    viewer.gridHelper.update(viewer.getCameraZoom(), true);
+                }
+                viewer.update(true, true);
+            }
+        }, true);
+
+        // Initialize on page load
+        window.addEventListener("load", initializeViewer);
+    </script>
+</head>
+<body style="padding: 0px; width: fit-content">
+    <div id="cad_viewer"></div>
+</body>
+</html>

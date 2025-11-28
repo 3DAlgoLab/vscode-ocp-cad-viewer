@@ -445,7 +445,7 @@ class Viewer:
             "\nNo browser registered. Please open the viewer in a browser or refresh the viewer page\n"
         )
 
-def handle_message(self, ws):
+    def handle_message(self, ws):
         """
         WebSocket message handler for bidirectional communication between Python and browser.
         
